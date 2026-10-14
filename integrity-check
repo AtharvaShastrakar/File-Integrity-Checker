@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+File Integrity Checker
+======================
+A tool that verifies the integrity of log files to detect tampering.
+Uses SHA-256 cryptographic hashing to ensure no unauthorized changes
+have been made to monitored files.
+
+Usage:
+    ./integrity-check init <path>            Initialize and store hashes
+    ./integrity-check check <path>           Check file(s) against stored hashes
+    ./integrity-check -check <path>          Check file(s) against stored hashes
+    ./integrity-check update <path>          Re-initialize hash for file/directory
+    ./integrity-check status                 Show all monitored files and their status
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def get_storage_paths():
+    """Determine the secure storage directory, checking ~/.integrity-check first with fallback."""
+    if "INTEGRITY_CHECK_DIR" in os.environ:
+        store_dir = Path(os.environ["INTEGRITY_CHECK_DIR"])
+    else:
+        home_dir = Path.home() / ".integrity-check"
+        try:
+            home_dir.mkdir(parents=True, exist_ok=True)
+            store_dir = home_dir
+        except (PermissionError, OSError):
+            store_dir = Path(__file__).resolve().parent / ".integrity-check"
+            store_dir.mkdir(parents=True, exist_ok=True)
+    return store_dir, store_dir / "hashes.json"
+
+
+HASH_STORE_DIR, HASH_STORE_FILE = get_storage_paths()
+
+
+# Colors for terminal output
+class Color:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def compute_sha256(filepath: str) -> str:
+    """Compute the SHA-256 hash of a file."""
+    sha256 = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+    except PermissionError:
+        print(f"{Color.RED}Error: Permission denied reading '{filepath}'.{Color.RESET}")
+        return None
+    except FileNotFoundError:
+        print(f"{Color.RED}Error: File not found '{filepath}'.{Color.RESET}")
+        return None
+    except OSError as e:
+        print(f"{Color.RED}Error reading '{filepath}': {e}{Color.RESET}")
+        return None
+    return sha256.hexdigest()
+
+
+def load_hash_store() -> dict:
+    """Load the stored hashes from the secure JSON file."""
+    if not HASH_STORE_FILE.exists():
+        return {}
+    try:
+        with open(HASH_STORE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        print(f"{Color.YELLOW}Warning: Hash store corrupted. Starting fresh.{Color.RESET}")
+        return {}
+
+
+def save_hash_store(data: dict) -> None:
+    """Save hashes to the secure JSON file with restricted permissions."""
+    HASH_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HASH_STORE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        os.chmod(HASH_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def get_log_files(path: str) -> list[str]:
+    """
+    Get a list of log files from the given path.
+    If path is a file, return it as a single-element list.
+    If path is a directory, recursively find all files within it.
+    """
+    target = Path(path).resolve()
+
+    if not target.exists():
+        # Check if the unresolved path exists or if it's genuinely missing
+        raw_path = Path(path)
+        if not raw_path.exists():
+            print(f"{Color.RED}Error: '{path}' does not exist.{Color.RESET}")
+            return []
+
+    if target.is_file():
+        return [str(target)]
+    elif target.is_dir():
+        files = []
+        errors = []
+
+        def on_walk_error(err):
+            errors.append(err)
+
+        for root, _, filenames in os.walk(target, onerror=on_walk_error):
+            for fname in sorted(filenames):
+                fpath = Path(root) / fname
+                if fpath.is_file():
+                    files.append(str(fpath.resolve()))
+
+        if errors:
+            for err in errors:
+                print(f"{Color.YELLOW}Warning: Cannot access '{err.filename}': {err.strerror}{Color.RESET}")
+
+        if not files and not errors:
+            print(f"{Color.YELLOW}Warning: No files found in '{path}'.{Color.RESET}")
+        return files
+    else:
+        print(f"{Color.RED}Error: '{path}' is not a valid regular file or directory.{Color.RESET}")
+        return []
+
+
+def cmd_init(path: str) -> None:
+    """Initialize and store hashes for the given file(s)."""
+    files = get_log_files(path)
+    if not files:
+        return
+
+    store = load_hash_store()
+    now = datetime.now(timezone.utc).isoformat()
+
+    count = 0
+    for filepath in files:
+        file_hash = compute_sha256(filepath)
+        if file_hash is None:
+            continue
+        store[filepath] = {
+            "hash": file_hash,
+            "algorithm": "sha256",
+            "initialized_at": now,
+            "last_checked": now,
+        }
+        count += 1
+
+    save_hash_store(store)
+    if count > 0:
+        print(f"{Color.GREEN}Hashes stored successfully.{Color.RESET}")
+
+
+def cmd_check(path: str) -> None:
+    """Check file(s) against their stored hashes."""
+    target = Path(path).resolve()
+    store = load_hash_store()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Determine files to inspect
+    if target.is_file():
+        files = [str(target)]
+    elif target.is_dir():
+        files = get_log_files(path)
+    elif str(target) in store:
+        # File was deleted/moved
+        files = [str(target)]
+    else:
+        # Check if user passed a path that matches a stored entry
+        matching_stored = [f for f in store if f == str(target) or f.startswith(str(target) + os.sep)]
+        if matching_stored:
+            files = matching_stored
+        else:
+            files = get_log_files(path)
+
+    if not files:
+        return
+
+    is_single_file = len(files) == 1
+    has_tampering = False
+
+    for filepath in files:
+        if filepath not in store:
+            print(f"{Color.YELLOW}File: {filepath}{Color.RESET}")
+            print(f"Status: {Color.YELLOW}Untracked (Not initialized){Color.RESET}\n")
+            continue
+
+        if not Path(filepath).exists():
+            if not is_single_file:
+                print(f"{Color.BOLD}{filepath}{Color.RESET}")
+            print(f"Status: {Color.RED}Deleted / Missing{Color.RESET}\n")
+            has_tampering = True
+            continue
+
+        current_hash = compute_sha256(filepath)
+        if current_hash is None:
+            continue
+
+        stored_hash = store[filepath]["hash"]
+        store[filepath]["last_checked"] = now
+
+        if current_hash == stored_hash:
+            if not is_single_file:
+                print(f"{Color.BOLD}{filepath}{Color.RESET}")
+            print(f"Status: {Color.GREEN}Unmodified{Color.RESET}\n")
+        else:
+            has_tampering = True
+            if not is_single_file:
+                print(f"{Color.BOLD}{filepath}{Color.RESET}")
+            print(f"Status: {Color.RED}Modified ({Color.RESET}{Color.BOLD}Hash mismatch{Color.RESET}{Color.RED}){Color.RESET}")
+            print(f"  Stored:  {stored_hash}")
+            print(f"  Current: {current_hash}\n")
+
+    save_hash_store(store)
+
+    if has_tampering:
+        sys.exit(1)
+
+
+def cmd_update(path: str) -> None:
+    """Re-initialize (update) stored hashes for the given file(s)."""
+    files = get_log_files(path)
+    if not files:
+        return
+
+    store = load_hash_store()
+    now = datetime.now(timezone.utc).isoformat()
+
+    count = 0
+    for filepath in files:
+        file_hash = compute_sha256(filepath)
+        if file_hash is None:
+            continue
+        store[filepath] = {
+            "hash": file_hash,
+            "algorithm": "sha256",
+            "initialized_at": now,
+            "last_checked": now,
+        }
+        count += 1
+
+    save_hash_store(store)
+    if count > 0:
+        print(f"{Color.GREEN}Hash updated successfully.{Color.RESET}")
+
+
+def cmd_status() -> None:
+    """Display all monitored files and their current status."""
+    store = load_hash_store()
+    if not store:
+        print("No files are currently being monitored.")
+        print(f"Run '{Color.CYAN}./integrity-check init <path>{Color.RESET}' to initialize.")
+        return
+
+    print(f"{Color.BOLD}Monitored Log Files:{Color.RESET}\n")
+
+    for filepath, info in sorted(store.items()):
+        exists = Path(filepath).exists()
+        if not exists:
+            status = f"{Color.RED}MISSING{Color.RESET}"
+        else:
+            current_hash = compute_sha256(filepath)
+            if current_hash == info["hash"]:
+                status = f"{Color.GREEN}OK (Unmodified){Color.RESET}"
+            else:
+                status = f"{Color.RED}MODIFIED{Color.RESET}"
+
+        init_time = info.get("initialized_at", "N/A")
+        print(f"  [{status}] {filepath}")
+        print(f"        Initialized: {init_time}")
+        print()
+
+    print(f"Total: {len(store)} file(s) monitored")
+
+
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Normalize command-line arguments, supporting both 'check' and '-check' / '--check' etc."""
+    normalized = []
+    for arg in argv:
+        if arg in ("-check", "--check"):
+            normalized.append("check")
+        elif arg in ("-init", "--init"):
+            normalized.append("init")
+        elif arg in ("-update", "--update"):
+            normalized.append("update")
+        elif arg in ("-status", "--status"):
+            normalized.append("status")
+        else:
+            normalized.append(arg)
+    return normalized
+
+
+def main():
+    sys.argv = [sys.argv[0]] + normalize_argv(sys.argv[1:])
+
+    parser = argparse.ArgumentParser(
+        prog="integrity-check",
+        description="File Integrity Checker — Detect tampering in log files using SHA-256 hashing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  %(prog)s init /var/log          Initialize hashes for all files in /var/log
+  %(prog)s check /var/log/syslog  Check a single file for modifications
+  %(prog)s -check /var/log/auth.log Check using flag syntax
+  %(prog)s update /var/log/syslog Re-initialize the hash after a known change
+  %(prog)s status                 Show all monitored files and their status
+""",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+
+    init_parser = subparsers.add_parser("init", help="Initialize and store hashes for log file(s)")
+    init_parser.add_argument("path", help="Path to a log file or directory")
+
+    check_parser = subparsers.add_parser("check", help="Check file(s) against stored hashes")
+    check_parser.add_argument("path", help="Path to a log file or directory")
+
+    update_parser = subparsers.add_parser("update", help="Re-initialize stored hash for file(s)")
+    update_parser.add_argument("path", help="Path to a log file or directory")
+
+    subparsers.add_parser("status", help="Show all monitored files and their status")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "init":
+        cmd_init(args.path)
+    elif args.command == "check":
+        cmd_check(args.path)
+    elif args.command == "update":
+        cmd_update(args.path)
+    elif args.command == "status":
+        cmd_status()
+
+
+if __name__ == "__main__":
+    main()
